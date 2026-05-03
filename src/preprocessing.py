@@ -2,8 +2,10 @@
 
 Responsibilities
 ----------------
-1. Load RACE CSV splits with the canonical schema:
-     id, article, question, A, B, C, D, answer
+1. Load RACE CSV splits — supports two schemas:
+     (a) Kaggle format:  example_id, article, answer, question, options
+     (b) Expanded format: id, article, question, A, B, C, D, answer
+   Schema (a) is auto-detected and converted to (b).
 2. Lowercase + light punctuation cleanup, tokenisation helpers.
 3. Expand each multiple-choice row into 4 supervised verifier examples
    `(article, question, option_text, label in {0, 1})`.
@@ -13,6 +15,7 @@ Responsibilities
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 from dataclasses import dataclass
@@ -27,7 +30,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 OPTION_LETTERS: Tuple[str, ...] = ("A", "B", "C", "D")
-REQUIRED_COLUMNS: Tuple[str, ...] = (
+REQUIRED_COLUMNS_EXPANDED: Tuple[str, ...] = (
     "id",
     "article",
     "question",
@@ -77,6 +80,86 @@ def split_sentences(article: object) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Options parsing (Kaggle format)
+# ---------------------------------------------------------------------------
+
+def _parse_options(options_str: object) -> List[str]:
+    """Parse the 'options' column from Kaggle RACE CSVs.
+
+    The column contains stringified Python lists like:
+        "['doctor' 'model' 'teacher' 'reporter']"   (space-separated)
+        "['doctor', 'model', 'teacher', 'reporter']" (comma-separated)
+    """
+    if options_str is None:
+        return ["", "", "", ""]
+    s = str(options_str).strip()
+    if not s:
+        return ["", "", "", ""]
+
+    # Try standard comma-separated list first
+    try:
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, (list, tuple)):
+            result = [str(x) for x in parsed]
+            while len(result) < 4:
+                result.append("")
+            return result[:4]
+    except (ValueError, SyntaxError):
+        pass
+
+    # Handle space-separated format: "['a' 'b' 'c' 'd']"
+    try:
+        fixed = s.replace("' '", "', '")
+        parsed = ast.literal_eval(fixed)
+        if isinstance(parsed, (list, tuple)):
+            result = [str(x) for x in parsed]
+            while len(result) < 4:
+                result.append("")
+            return result[:4]
+    except (ValueError, SyntaxError):
+        pass
+
+    # Last resort: regex extraction
+    items = re.findall(r"'([^']*)'", s)
+    if not items:
+        items = re.findall(r'"([^"]*)"', s)
+    while len(items) < 4:
+        items.append("")
+    return items[:4]
+
+
+def normalize_race_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a Kaggle-format RACE DataFrame to the canonical expanded format.
+
+    Kaggle format:  example_id, article, answer, question, options
+    Expanded format: id, article, question, A, B, C, D, answer
+    """
+    df = df.copy()
+
+    # Rename example_id -> id if needed
+    if "example_id" in df.columns and "id" not in df.columns:
+        df = df.rename(columns={"example_id": "id"})
+
+    # If options column exists but A/B/C/D don't, expand it
+    if "options" in df.columns and "A" not in df.columns:
+        parsed = df["options"].apply(_parse_options)
+        df["A"] = parsed.apply(lambda x: x[0])
+        df["B"] = parsed.apply(lambda x: x[1])
+        df["C"] = parsed.apply(lambda x: x[2])
+        df["D"] = parsed.apply(lambda x: x[3])
+        df = df.drop(columns=["options"], errors="ignore")
+
+    # Drop extra columns that may exist (article_len, question_len)
+    df = df.drop(columns=["article_len", "question_len"], errors="ignore")
+
+    # Ensure id column exists
+    if "id" not in df.columns:
+        df["id"] = [f"row_{i}" for i in range(len(df))]
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Loading / validation
 # ---------------------------------------------------------------------------
 
@@ -85,16 +168,19 @@ def load_race_csv(
     max_rows: Optional[int] = None,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """Load a RACE CSV split, validate the schema, optionally subsample."""
+    """Load a RACE CSV split, auto-detect schema, optionally subsample."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"RACE CSV not found at {path!r}")
     df = pd.read_csv(path)
 
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    # Auto-detect and normalize schema
+    df = normalize_race_df(df)
+
+    missing = [c for c in REQUIRED_COLUMNS_EXPANDED if c not in df.columns]
     if missing:
         raise ValueError(
             f"RACE CSV at {path!r} is missing required columns: {missing}. "
-            f"Expected: {list(REQUIRED_COLUMNS)}"
+            f"Expected: {list(REQUIRED_COLUMNS_EXPANDED)}"
         )
 
     df = df.dropna(subset=["article", "question", "answer"]).reset_index(drop=True)
