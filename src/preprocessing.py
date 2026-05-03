@@ -96,7 +96,19 @@ def _parse_options(options_str: object) -> List[str]:
     if not s:
         return ["", "", "", ""]
 
-    # Try standard comma-separated list first
+    # Primary approach: extract all single- or double-quoted substrings.
+    # Works for both space-separated and comma-separated formats.
+    items = re.findall(r"'([^']*)'", s)
+    if not items:
+        items = re.findall(r'"([^"]*)"', s)
+
+    if items:
+        result = [x.strip() for x in items]
+        while len(result) < 4:
+            result.append("")
+        return result[:4]
+
+    # Fallback: try ast.literal_eval (handles standard Python list repr)
     try:
         parsed = ast.literal_eval(s)
         if isinstance(parsed, (list, tuple)):
@@ -107,25 +119,7 @@ def _parse_options(options_str: object) -> List[str]:
     except (ValueError, SyntaxError):
         pass
 
-    # Handle space-separated format: "['a' 'b' 'c' 'd']"
-    try:
-        fixed = s.replace("' '", "', '")
-        parsed = ast.literal_eval(fixed)
-        if isinstance(parsed, (list, tuple)):
-            result = [str(x) for x in parsed]
-            while len(result) < 4:
-                result.append("")
-            return result[:4]
-    except (ValueError, SyntaxError):
-        pass
-
-    # Last resort: regex extraction
-    items = re.findall(r"'([^']*)'", s)
-    if not items:
-        items = re.findall(r'"([^"]*)"', s)
-    while len(items) < 4:
-        items.append("")
-    return items[:4]
+    return ["", "", "", ""]
 
 
 def normalize_race_df(df: pd.DataFrame) -> pd.DataFrame:
